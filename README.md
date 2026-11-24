@@ -121,6 +121,7 @@ curl localhost:8080/rpc -H "Authorization: Bearer $A2A_TOKEN" -d '{
 | `A2A_OIDC_ISSUER`    | none                     | Issuer of your OpenID Connect provider (Authentik: `https://auth.example.com/application/o/<slug>/`). Enables JWT validation. |
 | `A2A_OIDC_AUDIENCE`  | none                     | Accepted `aud` values, comma separated (Authentik: the client IDs). **Set it**: without it any token of the issuer is accepted. |
 | `A2A_OIDC_SCOPE`     | none                     | Scope the token must carry, for example `a2a`.                           |
+| `A2A_OIDC_REQUIRE_GROUP` | none               | Group the token's `groups` claim must contain (Authentik: add the `profile` scope and put the callers in this group). |
 | `A2A_OIDC_ALLOWED_SUBJECTS` | none             | Callers allowed, comma separated: a token is accepted if its `sub`, `preferred_username`, `azp`, `client_id` or `email` is in the list. Empty means any caller the provider accepts. |
 | `A2A_OIDC_JWKS_URL`  | from discovery           | Key set URL, when it cannot be found through `<issuer>/.well-known/openid-configuration`. |
 | `A2A_OIDC_ALGORITHMS`| `RS256,ES256`            | Accepted signature algorithms. HMAC ones are refused on purpose.         |
