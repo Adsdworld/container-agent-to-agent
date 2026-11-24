@@ -1,0 +1,22 @@
+# The agent and its A2A bridge share one data folder: the bridge only writes
+# to /agent/data/inbox/ and reads the answers the agent leaves there.
+services:
+  agent:
+    image: ghcr.io/adsdworld/container-agent-claude:latest
+    environment:
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN}
+      TZ: Europe/Paris
+    volumes:
+      - ./config:/agent/config:ro
+      - ./data:/agent/data
+
+  a2a:
+    image: ghcr.io/adsdworld/container-agent-to-agent:latest
+    environment:
+      A2A_TOKEN: ${A2A_TOKEN}              # clients send "Authorization: Bearer <token>"
+      A2A_PUBLIC_URL: https://agent.example.com
+      A2A_NAME: My agent
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/agent/data
