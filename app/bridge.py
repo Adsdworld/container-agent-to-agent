@@ -19,6 +19,7 @@ import os
 import re
 import threading
 import time
+import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -129,6 +130,11 @@ class Config:
         self.max_pending = int(env.get("A2A_MAX_PENDING", "20"))
         self.preamble = env.get("A2A_PREAMBLE", DEFAULT_PREAMBLE)
         self.run_max = float(env.get("A2A_RUN_MAX", "7200"))
+        self.oidc_issuer = env.get("A2A_OIDC_ISSUER", "").strip()
+        self.oidc_audience = [a.strip() for a in env.get("A2A_OIDC_AUDIENCE", "").split(",") if a.strip()]
+        self.oidc_scope = env.get("A2A_OIDC_SCOPE", "").strip()
+        self.oidc_jwks_url = env.get("A2A_OIDC_JWKS_URL", "").strip()
+        self.oidc_algorithms = [a.strip() for a in env.get("A2A_OIDC_ALGORITHMS", "RS256,ES256").split(",") if a.strip()]
 
     @property
     def inbox(self):
@@ -258,7 +264,7 @@ class Store:
                 return result.strip()
         return None
 
-    def create(self, text, context_id):
+    def create(self, text, context_id, caller=None):
         with self.lock:
             if self.pending_count() >= self.config.max_pending:
                 raise RpcError(
@@ -272,6 +278,8 @@ class Store:
             lines = [HEADER.format(task=task_id, context=context_id, created=iso(now()))]
             if self.config.preamble:
                 lines.append(self.config.preamble)
+            if caller:
+                lines.append(f"Authenticated caller: {caller}.")
             lines += ["", REQUEST_START, text, REQUEST_END, ""]
             # A dot file is ignored by the agent: it only sees the finished one.
             temporary = self.config.inbox / f".{self.filename(task_id)}.tmp"
@@ -433,12 +441,78 @@ class Store:
             return self._build(marker, CANCELED, 0, False)
 
 
+class AuthError(Exception):
+    def __init__(self, status, error, description):
+        super().__init__(description)
+        self.status = status
+        self.error = error
+        self.description = description
+
+    def www_authenticate(self):
+        if not self.error:
+            return 'Bearer realm="a2a"'
+        return f'Bearer realm="a2a", error="{self.error}", error_description="{self.description}"'
+
+
+class OidcVerifier:
+    """Checks the JWTs of an OpenID Connect provider (Authentik, Keycloak, ...)."""
+
+    def __init__(self, config):
+        self.config = config
+        self.lock = threading.Lock()
+        self.client = None
+
+    def _jwks_client(self):
+        import jwt
+
+        with self.lock:
+            if self.client is None:
+                url = self.config.oidc_jwks_url
+                if not url:
+                    discovery = self.config.oidc_issuer.rstrip("/") + "/.well-known/openid-configuration"
+                    with urllib.request.urlopen(discovery, timeout=5) as response:
+                        url = json.load(response)["jwks_uri"]
+                self.client = jwt.PyJWKClient(url, cache_keys=True, lifespan=3600, timeout=5)
+            return self.client
+
+    def verify(self, token):
+        """Returns the claims of a valid token, raises AuthError otherwise."""
+        import jwt
+
+        unreachable = AuthError(503, "temporarily_unavailable", "identity provider unreachable")
+        try:
+            key = self._jwks_client().get_signing_key_from_jwt(token).key
+            audience = self.config.oidc_audience
+            claims = jwt.decode(
+                token, key,
+                algorithms=self.config.oidc_algorithms,
+                issuer=self.config.oidc_issuer,
+                audience=audience or None,
+                leeway=30,
+                options={"require": ["exp", "iss", "sub"], "verify_aud": bool(audience)},
+            )
+        except (jwt.PyJWKClientConnectionError, OSError) as error:
+            log.warning("identity provider unreachable: %s", error)
+            raise unreachable
+        except (jwt.PyJWTError, ValueError, KeyError) as error:
+            raise AuthError(401, "invalid_token", type(error).__name__)
+        needed = self.config.oidc_scope
+        if needed:
+            scope = claims.get("scope", claims.get("scp", ""))
+            granted = set(scope.split() if isinstance(scope, str) else scope)
+            if needed not in granted:
+                raise AuthError(403, "insufficient_scope", f"scope {needed} is required")
+        return claims
+
+
 class Bridge:
     """The A2A methods, independent of HTTP."""
 
     def __init__(self, config):
         self.config = config
         self.store = Store(config)
+        self.verifier = OidcVerifier(config) if config.oidc_issuer else None
+        self.local = threading.local()
 
     def agent_card(self):
         card = {
@@ -467,16 +541,43 @@ class Bridge:
                 }
             ],
         }
+        schemes, requirements = {}, []
+        if self.verifier:
+            url = self.config.oidc_issuer.rstrip("/") + "/.well-known/openid-configuration"
+            schemes["oidc"] = {"openIdConnectSecurityScheme": {"openIdConnectUrl": url}}
+            scopes = [self.config.oidc_scope] if self.config.oidc_scope else []
+            requirements.append({"schemes": {"oidc": {"list": scopes}}})
         if self.config.token:
-            card["securitySchemes"] = {"bearer": {"httpAuthSecurityScheme": {"scheme": "Bearer"}}}
-            card["securityRequirements"] = [{"schemes": {"bearer": {"list": []}}}]
+            schemes["bearer"] = {"httpAuthSecurityScheme": {"scheme": "Bearer"}}
+            requirements.append({"schemes": {"bearer": {"list": []}}})
+        if schemes:
+            card["securitySchemes"] = schemes
+            card["securityRequirements"] = requirements  # alternatives: one is enough
         return card
 
-    def authorized(self, header):
-        if not self.config.token:
-            return True
+    @property
+    def auth_required(self):
+        return bool(self.config.token or self.verifier)
+
+    def authenticate(self, header):
+        """Returns the caller's name, or None when anonymous access is allowed.
+
+        Raises AuthError. A token is accepted if it is the static token or a
+        valid JWT of the configured identity provider.
+        """
+        if not self.auth_required:
+            return None
         scheme, _, value = (header or "").partition(" ")
-        return scheme.lower() == "bearer" and hmac.compare_digest(value.strip(), self.config.token)
+        value = value.strip()
+        if scheme.lower() != "bearer" or not value:
+            raise AuthError(401, None, "bearer token required")
+        if self.config.token and hmac.compare_digest(value, self.config.token):
+            return "static-token"
+        if self.verifier and value.count(".") == 2:
+            claims = self.verifier.verify(value)
+            name = str(claims.get("azp") or claims.get("client_id") or claims["sub"])
+            return re.sub(r"[^\w.@:-]", "", name)[:100] or "unknown"
+        raise AuthError(401, "invalid_token", "unknown token")
 
     def check_version(self, version):
         if version and version.split(".")[0] != PROTOCOL_VERSION.split(".")[0]:
@@ -485,8 +586,9 @@ class Bridge:
                 "VERSION_NOT_SUPPORTED", {"supported": PROTOCOL_VERSION},
             )
 
-    def handle(self, request, version=None):
+    def handle(self, request, version=None, caller=None):
         """Handles one JSON-RPC request object, returns the response object."""
+        self.local.caller = caller
         request_id = request.get("id") if isinstance(request, dict) else None
         try:
             if not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or not isinstance(request.get("method"), str):
@@ -551,7 +653,7 @@ class Bridge:
 
         configuration = params.get("configuration") or {}
         history_length = configuration.get("historyLength") or 0
-        task_id = self.store.create(text, context_id)
+        task_id = self.store.create(text, context_id, getattr(self.local, "caller", None))
         log.info("task %s submitted", task_id)
 
         if not configuration.get("returnImmediately"):
@@ -635,9 +737,12 @@ def make_handler(bridge):
         def do_POST(self):
             if self.path.split("?")[0] not in ("/", "/rpc"):
                 return self.send_json(404, {"error": "not found"})
-            if not bridge.authorized(self.headers.get("Authorization")):
+            try:
+                caller = bridge.authenticate(self.headers.get("Authorization"))
+            except AuthError as error:
                 return self.send_json(
-                    401, {"error": "unauthorized"}, {"WWW-Authenticate": 'Bearer realm="a2a"'}
+                    error.status, {"error": error.error or "unauthorized"},
+                    {"WWW-Authenticate": error.www_authenticate()},
                 )
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -656,7 +761,7 @@ def make_handler(bridge):
                 if isinstance(request, list):
                     response = {"jsonrpc": "2.0", "id": None, "error": invalid_request("Batches are not supported").to_json()}
                 else:
-                    response = bridge.handle(request, version)
+                    response = bridge.handle(request, version, caller)
             self.send_json(200, response, {"A2A-Version": PROTOCOL_VERSION})
 
     return Handler
@@ -668,7 +773,8 @@ def serve(config=None):
     server = ThreadingHTTPServer(("0.0.0.0", config.port), make_handler(bridge))
     server.daemon_threads = True
     log.info("A2A bridge %s on :%d, inbox %s, auth %s", VERSION, config.port, config.inbox,
-             "bearer token" if config.token else "NONE")
+             ", ".join(filter(None, [f"oidc {config.oidc_issuer}" if config.oidc_issuer else "",
+                                     "static token" if config.token else ""])) or "NONE")
     server.serve_forever()
 
 
