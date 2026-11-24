@@ -7,9 +7,9 @@ file and moves it to inbox/done/: that move is what completes the A2A task.
 
 Task state lives entirely on disk, so the bridge itself is stateless:
 
-    inbox/a2a-<id>.md        task submitted, the agent has not answered yet
+    inbox/a2a-<id>.md        task submitted or being worked on (agent.log tells which)
     inbox/done/a2a-<id>.md   task completed (or failed if nothing was answered)
-    state/a2a/canceled/<id>.json   task canceled before the agent took it
+    state/a2a/canceled/<id>.json   task canceled (a cancel file is also left in the inbox)
 """
 
 import hmac
@@ -20,7 +20,7 @@ import re
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -38,6 +38,7 @@ ID_RE = re.compile(r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 CONTEXT_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,128}\Z")
 
 SUBMITTED = "TASK_STATE_SUBMITTED"
+WORKING = "TASK_STATE_WORKING"
 COMPLETED = "TASK_STATE_COMPLETED"
 FAILED = "TASK_STATE_FAILED"
 CANCELED = "TASK_STATE_CANCELED"
@@ -127,6 +128,7 @@ class Config:
         self.max_body = int(env.get("A2A_MAX_BODY", str(1024 * 1024)))
         self.max_pending = int(env.get("A2A_MAX_PENDING", "20"))
         self.preamble = env.get("A2A_PREAMBLE", DEFAULT_PREAMBLE)
+        self.run_max = float(env.get("A2A_RUN_MAX", "7200"))
 
     @property
     def inbox(self):
@@ -151,11 +153,110 @@ class Store:
             folder.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
-    def filename(task_id):
-        return f"a2a-{task_id}.md"
+    def filename(task_id, cancel=False):
+        return f"a2a-{task_id}{'-cancel' if cancel else ''}.md"
+
+    @staticmethod
+    def _answer_of(path):
+        """The text written after the request marker of a file, or ''."""
+        try:
+            raw = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        end = raw.find(REQUEST_END)
+        return raw[end + len(REQUEST_END) :].strip() if end >= 0 else ""
 
     def pending_count(self):
-        return sum(1 for _ in self.config.inbox.glob("a2a-*.md"))
+        return sum(1 for p in self.config.inbox.glob("a2a-*.md") if not p.name.endswith("-cancel.md"))
+
+    # -- what the agent says about itself: logs/agent.log and the run transcripts
+
+    def _runs(self):
+        """Runs found at the end of agent.log, oldest first."""
+        try:
+            with (self.config.data_dir / "logs" / "agent.log").open("rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - 131072))
+                text = f.read().decode("utf-8", "replace")
+        except OSError:
+            return []
+        runs = []
+        for line in text.splitlines():
+            stamp, _, message = line.partition(" ")
+            try:
+                moment = datetime.fromisoformat(stamp)
+            except ValueError:
+                continue
+            if message.startswith("run started,"):
+                runs.append({"start": moment, "end": None, "transcript": None})
+            elif message.startswith("run ended with status") and runs and runs[-1]["end"] is None:
+                runs[-1]["end"] = moment
+                found = re.search(r"transcript (\S+)", message)
+                runs[-1]["transcript"] = found[1] if found else None
+        return runs
+
+    def active_run(self):
+        runs = self._runs()
+        if runs and runs[-1]["end"] is None:
+            age = (now() - runs[-1]["start"]).total_seconds()
+            if age < self.config.run_max:  # a crashed container never logs the end
+                return runs[-1]
+        return None
+
+    def run_at(self, moment):
+        for run in reversed(self._runs()):
+            if run["start"] <= moment and (run["end"] is None or moment <= run["end"].replace(microsecond=0) + timedelta(seconds=2)):
+                return run
+        return None
+
+    @staticmethod
+    def _tail_lines(path, size):
+        try:
+            with path.open("rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - size))
+                return f.read().decode("utf-8", "replace").splitlines()[::-1]
+        except OSError:
+            return []
+
+    def progress(self):
+        """What the running agent last said or did, from its newest transcript."""
+        runs = self.config.data_dir / "logs" / "runs"
+        try:
+            newest = max(runs.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+        except (ValueError, OSError):
+            return None
+        for line in self._tail_lines(newest, 65536):
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("type") != "assistant":
+                continue
+            blocks = (event.get("message") or {}).get("content") or []
+            for block in reversed(blocks if isinstance(blocks, list) else []):
+                if block.get("type") == "text" and block.get("text", "").strip():
+                    return block["text"].strip()[:300]
+                if block.get("type") == "tool_use":
+                    return f"Using tool {block.get('name', '?')}"
+        return None
+
+    def run_result(self, run):
+        """The final text of a finished run, when the agent wrote no answer in the file."""
+        if not run or not run["transcript"]:
+            return None
+        path = self.config.data_dir / "logs" / "runs" / Path(run["transcript"]).name
+        for line in self._tail_lines(path, 262144):
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("type") == "result":
+                result = event.get("result")
+                if event.get("is_error") or not isinstance(result, str) or not result.strip():
+                    return None
+                return result.strip()
+        return None
 
     def create(self, text, context_id):
         with self.lock:
@@ -192,8 +293,10 @@ class Store:
         return None, None
 
     def is_finished(self, task_id):
-        _, state = self.locate(task_id)
-        return state in TERMINAL
+        try:
+            return self.task(task_id, include_artifacts=False)["status"]["state"] in TERMINAL
+        except RpcError:
+            return True
 
     def task(self, task_id, history_length=0, include_artifacts=True):
         path, state = self.locate(task_id)
@@ -204,11 +307,18 @@ class Store:
     def _build(self, path, state, history_length, include_artifacts):
         if state == CANCELED:
             info = json.loads(path.read_text(encoding="utf-8"))
-            return {
+            task = {
                 "id": info["id"],
                 "contextId": info["contextId"],
                 "status": {"state": CANCELED, "timestamp": info["canceled"]},
             }
+            # What the agent said when it was told to stop, once it has said it.
+            reply = self._answer_of(self.config.done / self.filename(info["id"], cancel=True))
+            if reply:
+                task["status"]["message"] = text_message(
+                    f"{info['id']}-cancel", "ROLE_AGENT", reply, info["contextId"], info["id"]
+                )
+            return task
         try:
             raw = path.read_text(encoding="utf-8", errors="replace")
         except FileNotFoundError:  # moved while we looked at it
@@ -224,20 +334,35 @@ class Store:
         answer = raw[end + len(REQUEST_END) :].strip() if end >= 0 else ""
 
         timestamp = header["created"]
-        if state == COMPLETED:
-            timestamp = iso(datetime.fromtimestamp(path.stat().st_mtime, timezone.utc))
+        note, source = None, None
+        if state == SUBMITTED:
+            # A run that started after the message was written has listed it.
+            run = self.active_run()
+            created = datetime.fromisoformat(timestamp).replace(microsecond=0)
+            if run and run["start"] >= created:
+                state, note = WORKING, self.progress()
+        else:
+            moved = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+            timestamp = iso(moved)
             if not answer:
-                state = FAILED
+                # Moved to done/ with nothing written: the run's final text is the answer.
+                run = self.run_at(moved)
+                if run and run["end"] is None:
+                    state, note = WORKING, self.progress()
+                elif (answer := self.run_result(run) or ""):
+                    source = "run-transcript"
+                else:
+                    state = FAILED
+                    note = "The agent closed the message without writing an answer."
         task = {"id": task_id, "contextId": context_id, "status": {"state": state, "timestamp": timestamp}}
-        if state == FAILED:
-            task["status"]["message"] = text_message(
-                f"{task_id}-status", "ROLE_AGENT",
-                "The agent closed the message without writing an answer.", context_id, task_id,
-            )
+        if note:
+            task["status"]["message"] = text_message(f"{task_id}-status", "ROLE_AGENT", note, context_id, task_id)
         if state == COMPLETED and include_artifacts:
-            task["artifacts"] = [
-                {"artifactId": f"{task_id}-answer", "name": "answer", "parts": [{"text": answer, "mediaType": "text/plain"}]}
-            ]
+            artifact = {"artifactId": f"{task_id}-answer", "name": "answer",
+                        "parts": [{"text": answer, "mediaType": "text/plain"}]}
+            if source:
+                artifact["metadata"] = {"answerSource": source}
+            task["artifacts"] = [artifact]
         if history_length:
             history = [text_message(f"{task_id}-request", "ROLE_USER", request, context_id, task_id)]
             if state == COMPLETED:
@@ -254,6 +379,10 @@ class Store:
         ):
             pattern = "*.json" if expected == CANCELED else "a2a-*.md"
             for path in folder.glob(pattern):
+                if path.name.endswith("-cancel.md"):
+                    continue
+                if expected != CANCELED and (self.config.canceled / f"{path.stem.removeprefix('a2a-')}.json").exists():
+                    continue  # canceled: listed once, from its marker
                 try:
                     task = self._build(path, expected, history_length, include_artifacts)
                 except (RpcError, json.JSONDecodeError, KeyError, OSError):
@@ -267,28 +396,41 @@ class Store:
         return found
 
     def cancel(self, task_id):
+        """Asks the agent to stop: the request is a file of its own in the inbox.
+
+        Removing the task's file would not do, the agent may already be working
+        on it. The task is CANCELED for the client at once; the agent's reply to
+        the cancel file, once written, is shown as the status message.
+        """
         with self.lock:
             path, state = self.locate(task_id)
             if path is None:
                 raise task_not_found(task_id)
-            if state != SUBMITTED:
-                raise RpcError(
-                    -32002, "Task cannot be canceled", "TASK_NOT_CANCELABLE",
-                    {"taskId": task_id, "state": state},
-                )
             task = self._build(path, state, 0, False)
-            record = {"id": task_id, "contextId": task["contextId"], "canceled": iso(now())}
-            (self.config.canceled / f"{task_id}.json").write_text(json.dumps(record), encoding="utf-8")
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                # The agent moved it first: too late to cancel.
-                (self.config.canceled / f"{task_id}.json").unlink(missing_ok=True)
+            if task["status"]["state"] not in (SUBMITTED, WORKING):
                 raise RpcError(
                     -32002, "Task cannot be canceled", "TASK_NOT_CANCELABLE",
-                    {"taskId": task_id, "state": COMPLETED},
+                    {"taskId": task_id, "state": task["status"]["state"]},
                 )
-            return self._build(self.config.canceled / f"{task_id}.json", CANCELED, 0, False)
+            lines = [f"<!-- a2a cancel task={task_id} -->"]
+            if self.config.preamble:
+                lines.append(self.config.preamble)
+            lines += [
+                "",
+                REQUEST_START,
+                f"The A2A client canceled task {task_id} (file {self.filename(task_id)}, in inbox/ or "
+                "already in inbox/done/). Stop working on it now, undo what you can, and do not "
+                "answer it. Reply here in one line: what you stopped or undid.",
+                REQUEST_END,
+                "",
+            ]
+            temporary = self.config.inbox / f".{self.filename(task_id, cancel=True)}.tmp"
+            temporary.write_text("\n".join(lines), encoding="utf-8")
+            os.replace(temporary, self.config.inbox / self.filename(task_id, cancel=True))
+            record = {"id": task_id, "contextId": task["contextId"], "canceled": iso(now())}
+            marker = self.config.canceled / f"{task_id}.json"
+            marker.write_text(json.dumps(record), encoding="utf-8")
+            return self._build(marker, CANCELED, 0, False)
 
 
 class Bridge:

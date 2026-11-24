@@ -34,7 +34,13 @@ def agent_answers(tmp, task_id, answer):
     path = Path(tmp) / "inbox" / f"a2a-{task_id}.md"
     with path.open("a", encoding="utf-8") as f:
         f.write(f"\n{answer}\n")
-    path.rename(Path(tmp) / "inbox" / "done" / path.name)
+    for _ in range(50):  # Windows refuses to move a file the bridge is reading
+        try:
+            path.rename(Path(tmp) / "inbox" / "done" / path.name)
+            return
+        except PermissionError:
+            threading.Event().wait(0.02)
+    raise AssertionError("could not move the file")
 
 
 class BridgeTest(unittest.TestCase):
@@ -115,13 +121,29 @@ class BridgeTest(unittest.TestCase):
                               "params": {"pageSize": 2, "pageToken": page["nextPageToken"]}})["result"]
         self.assertEqual(len(rest["tasks"]), 1)
 
-    def test_cancel_pending_task(self):
+    def test_cancel_drops_a_cancel_file_and_keeps_the_task_file(self):
         task = send(self.b)["result"]["task"]
         canceled = self.b.handle({"jsonrpc": "2.0", "id": 1, "method": "CancelTask",
                                   "params": {"id": task["id"]}})["result"]
         self.assertEqual(canceled["status"]["state"], "TASK_STATE_CANCELED")
-        self.assertFalse((Path(self.tmp) / "inbox" / f"a2a-{task['id']}.md").exists())
+        inbox = Path(self.tmp) / "inbox"
+        self.assertTrue((inbox / f"a2a-{task['id']}.md").exists(), "the agent may be working on it")
+        cancel = (inbox / f"a2a-{task['id']}-cancel.md").read_text(encoding="utf-8")
+        self.assertIn(task["id"], cancel)
         self.assertEqual(self.b.store.task(task["id"])["status"]["state"], "TASK_STATE_CANCELED")
+        # the cancel file is not a task, and the agent's late answer changes nothing
+        self.assertEqual(self.b.store.pending_count(), 1)
+        agent_answers(self.tmp, task["id"], "too late")
+        self.assertEqual(self.b.store.task(task["id"])["status"]["state"], "TASK_STATE_CANCELED")
+        listed = self.b.handle({"jsonrpc": "2.0", "id": 1, "method": "ListTasks", "params": {}})["result"]
+        self.assertEqual(listed["totalSize"], 1)
+
+    def test_cancel_reply_of_the_agent_is_the_status_message(self):
+        task = send(self.b)["result"]["task"]
+        self.b.store.cancel(task["id"])
+        agent_answers(self.tmp, task["id"] + "-cancel", "Stopped, nothing to undo.")
+        status = self.b.store.task(task["id"])["status"]
+        self.assertEqual(status["message"]["parts"][0]["text"], "Stopped, nothing to undo.")
 
     def test_cancel_completed_task_is_refused(self):
         task = send(self.b)["result"]["task"]
@@ -129,6 +151,53 @@ class BridgeTest(unittest.TestCase):
         error = self.b.handle({"jsonrpc": "2.0", "id": 1, "method": "CancelTask",
                                "params": {"id": task["id"]}})["error"]
         self.assertEqual(error["code"], -32002)
+
+    def log(self, *lines):
+        path = Path(self.tmp) / "logs"
+        path.mkdir(exist_ok=True)
+        with (path / "agent.log").open("a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+    def transcript(self, name, *events):
+        folder = Path(self.tmp) / "logs" / "runs"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / name).write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+
+    def test_working_with_progress_while_a_run_is_active(self):
+        task = send(self.b)["result"]["task"]
+        start = bridge.iso(bridge.now()).replace("Z", "+00:00")[:19] + "+00:00"
+        self.log(f"{start} run started, model sonnet, effort medium")
+        self.transcript("r1.jsonl", {"type": "system"}, {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Looking at the backups"}, {"type": "tool_use", "name": "Bash"}]}})
+        status = self.b.store.task(task["id"])["status"]
+        self.assertEqual(status["state"], "TASK_STATE_WORKING")
+        self.assertEqual(status["message"]["parts"][0]["text"], "Using tool Bash")
+
+    def test_run_started_before_the_message_does_not_count(self):
+        self.log("2020-01-01T00:00:00+00:00 run started, model sonnet, effort medium")
+        task = send(self.b)["result"]["task"]
+        self.assertEqual(task["status"]["state"], "TASK_STATE_SUBMITTED")
+
+    def test_moved_without_answer_uses_the_run_result(self):
+        task = send(self.b)["result"]["task"]
+        agent_answers(self.tmp, task["id"], "")
+        moved = bridge.now()
+        start = (moved - bridge.timedelta(seconds=30)).replace(microsecond=0).isoformat()
+        end = (moved + bridge.timedelta(seconds=30)).replace(microsecond=0).isoformat()
+        self.transcript("r1.jsonl", {"type": "result", "result": "Everything is filed.", "is_error": False})
+        self.log(f"{start} run started, model sonnet, effort medium",
+                 f"{end} run ended with status 0, transcript /agent/data/logs/runs/r1.jsonl")
+        got = self.b.store.task(task["id"])
+        self.assertEqual(got["status"]["state"], "TASK_STATE_COMPLETED")
+        self.assertEqual(got["artifacts"][0]["parts"][0]["text"], "Everything is filed.")
+        self.assertEqual(got["artifacts"][0]["metadata"]["answerSource"], "run-transcript")
+
+    def test_moved_without_answer_while_the_run_is_still_active_is_working(self):
+        task = send(self.b)["result"]["task"]
+        agent_answers(self.tmp, task["id"], "")
+        start = (bridge.now() - bridge.timedelta(seconds=30)).replace(microsecond=0).isoformat()
+        self.log(f"{start} run started, model sonnet, effort medium")
+        self.assertEqual(self.b.store.task(task["id"])["status"]["state"], "TASK_STATE_WORKING")
 
     def test_errors(self):
         def call(method, params=None, **kw):

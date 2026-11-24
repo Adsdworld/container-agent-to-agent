@@ -24,10 +24,22 @@ tasks survive a restart of either container.
 
 | A2A task state | What the bridge sees                                                    |
 | -------------- | ----------------------------------------------------------------------- |
-| `SUBMITTED`    | `inbox/a2a-<id>.md` exists, the agent has not answered yet              |
+| `SUBMITTED`    | `inbox/a2a-<id>.md` exists and no run has listed it yet                 |
+| `WORKING`      | a run started after the file was written (from `logs/agent.log`); `status.message` shows what the agent last said or which tool it uses (from the run's transcript) |
 | `COMPLETED`    | the file is in `inbox/done/` with an answer after the request; the answer is the task's artifact |
-| `FAILED`       | the file is in `inbox/done/` but the agent wrote no answer              |
-| `CANCELED`     | `CancelTask` removed the file before the agent took it                  |
+| `COMPLETED` (fallback) | the file was moved without an answer: the final text of that run, read from its transcript, is the artifact, marked `answerSource: run-transcript` |
+| `FAILED`       | moved without an answer and the run has no usable final text            |
+| `CANCELED`     | `CancelTask` was called (see below)                                     |
+
+### Cancel
+
+Deleting the file would not work: the agent is woken as soon as the file lands and
+may already be working on it. `CancelTask` instead drops a second file,
+`inbox/a2a-<id>-cancel.md`, that tells the agent to stop, undo what it can and
+reply in one line. The task is `CANCELED` for the client at once and stays so
+whatever the agent writes later; the agent's reply, when it comes, appears as
+`status.message`. Cancel is refused (`-32002`) once the task is finished. Stopping is
+best effort: it depends on the agent reading the file.
 
 The file looks like this; the agent writes after the last marker:
 
@@ -52,7 +64,7 @@ returns the task in state `SUBMITTED`; clients then poll `GetTask`. With
 | Agent Card at `/.well-known/agent-card.json` | yes, with a bearer security scheme when `A2A_TOKEN` is set |
 | `SendMessage`                         | yes, text parts only (`-32005` otherwise)                        |
 | `GetTask`, `ListTasks`                | yes (`historyLength`, `contextId`, `status`, pagination)         |
-| `CancelTask`                          | only while the agent has not moved the file (`-32002` after)     |
+| `CancelTask`                          | drops a cancel file for the agent, refused once the task is finished (`-32002`) |
 | `contextId`                           | kept in the file and filterable; a new message in a context is a new task |
 | Streaming, push notifications, extended card | no, answered with the matching A2A errors (`-32004`, `-32003`, `-32007`) |
 
@@ -113,6 +125,7 @@ curl localhost:8080/rpc -H "Authorization: Bearer $A2A_TOKEN" -d '{
 | `A2A_BLOCK_TIMEOUT`  | `300`                    | Seconds `SendMessage` waits for the answer before returning the pending task. |
 | `A2A_MAX_PENDING`    | `20`                     | Messages waiting for the agent at most; further ones are refused.        |
 | `A2A_PREAMBLE`       | "…not typed by your human." | Line added under the header of every message; empty to disable.       |
+| `A2A_RUN_MAX`        | `7200`                   | Seconds after which a run with no end in `agent.log` is no longer considered active. |
 | `A2A_PORT`           | `8080`                   | Listening port.                                                          |
 | `A2A_DATA_DIR`       | `/agent/data`            | The agent's data folder (the bridge uses `inbox/` and `state/a2a/`).     |
 | `A2A_MAX_BODY`       | `1048576`                | Largest request body, in bytes.                                          |
