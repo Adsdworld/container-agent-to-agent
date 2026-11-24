@@ -136,6 +136,16 @@ class OidcTest(unittest.TestCase):
         error = self.refused(b, self.token(scope="openid"), 403)
         self.assertEqual(error.error, "insufficient_scope")
 
+    def test_allowed_subjects_limit_who_may_call(self):
+        b = self.bridge(A2A_OIDC_ALLOWED_SUBJECTS="svc-jarvis, svc-herald")
+        self.auth(b, self.token(sub="hash-1", preferred_username="svc-jarvis"))
+        self.auth(b, self.token(sub="svc-herald"))
+        error = self.refused(b, self.token(sub="hash-2", preferred_username="svc-other", azp="someone-else"), 403)
+        self.assertEqual(error.error, "access_denied")
+
+    def test_no_allowlist_means_any_valid_caller(self):
+        self.auth(self.bridge(), self.token(sub="anyone"))
+
     def test_audience_may_be_a_list_of_clients(self):
         b = self.bridge(A2A_OIDC_AUDIENCE="other-client, " + AUDIENCE)
         self.auth(b, self.token())

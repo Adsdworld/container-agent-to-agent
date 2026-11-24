@@ -134,6 +134,7 @@ class Config:
         self.oidc_audience = [a.strip() for a in env.get("A2A_OIDC_AUDIENCE", "").split(",") if a.strip()]
         self.oidc_scope = env.get("A2A_OIDC_SCOPE", "").strip()
         self.oidc_jwks_url = env.get("A2A_OIDC_JWKS_URL", "").strip()
+        self.oidc_allowed_subjects = [s.strip() for s in env.get("A2A_OIDC_ALLOWED_SUBJECTS", "").split(",") if s.strip()]
         self.oidc_algorithms = [a.strip() for a in env.get("A2A_OIDC_ALGORITHMS", "RS256,ES256").split(",") if a.strip()]
 
     @property
@@ -502,6 +503,11 @@ class OidcVerifier:
             granted = set(scope.split() if isinstance(scope, str) else scope)
             if needed not in granted:
                 raise AuthError(403, "insufficient_scope", f"scope {needed} is required")
+        allowed = self.config.oidc_allowed_subjects
+        if allowed:
+            names = {str(claims[k]) for k in ("sub", "preferred_username", "azp", "client_id", "email") if claims.get(k)}
+            if not names & set(allowed):
+                raise AuthError(403, "access_denied", "this caller is not allowed")
         return claims
 
 
