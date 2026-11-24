@@ -587,7 +587,7 @@ class Bridge:
             return "static-token"
         if self.verifier and value.count(".") == 2:
             claims = self.verifier.verify(value)
-            name = str(claims.get("azp") or claims.get("client_id") or claims["sub"])
+            name = str(claims.get("preferred_username") or claims.get("azp") or claims.get("client_id") or claims["sub"])
             return re.sub(r"[^\w.@:-]", "", name)[:100] or "unknown"
         raise AuthError(401, "invalid_token", "unknown token")
 

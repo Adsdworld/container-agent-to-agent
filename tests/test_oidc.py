@@ -94,6 +94,9 @@ class OidcTest(unittest.TestCase):
     def test_valid_token(self):
         self.assertEqual(self.auth(self.bridge(), self.token()), AUDIENCE)
 
+    def test_caller_name_is_the_username_when_the_provider_gives_one(self):
+        self.assertEqual(self.auth(self.bridge(), self.token(preferred_username="agent-jarvis")), "agent-jarvis")
+
     def test_caller_is_written_in_the_inbox_file(self):
         b = self.bridge()
         caller = self.auth(b, self.token())
